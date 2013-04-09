@@ -67,6 +67,10 @@ function commerce_paypal_wpp_commerce_payment_method_info() {
     'short_title' => t('PayPal WPP'),
     'display_title' => t('Credit card'),
     'description' => t('PayPal Website Payments Pro'),
+    'cardonfile' => array(
+      'update callback' => 'commerce_paypal_wpp_cardonfile_update',
+      'delete callback' => 'commerce_paypal_wpp_cardonfile_delete',
+    ),
   );
 
   return $payment_methods;
@@ -88,6 +92,7 @@ function commerce_paypal_wpp_default_settings() {
     'currency_code' => in_array($default_currency, array_keys(commerce_paypal_currencies('paypal_wpp'))) ? $default_currency : 'USD',
     'allow_supported_currencies' => FALSE,
     'txn_type' => COMMERCE_CREDIT_AUTH_CAPTURE,
+    'cardonfile' => FALSE,
     'log' => array('request' => 0, 'response' => 0),
   );
 }
@@ -163,6 +168,15 @@ function commerce_paypal_wpp_settings_form($settings = array()) {
     ),
     '#default_value' => $settings['txn_type'],
   );
+
+  if (module_exists('commerce_cardonfile')) {
+    $form['cardonfile'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Enable Card on File functionality with this payment method using PayPal Reference Transactions'),
+      '#default_value' => $settings['cardonfile'],
+    );
+  }
+
   $form['log'] = array(
     '#type' => 'checkboxes',
     '#title' => t('Log the following messages for debugging'),
@@ -213,6 +227,11 @@ function commerce_paypal_wpp_submit_form($payment_method, $pane_values, $checkou
  * Payment method callback: checkout form validation.
  */
 function commerce_paypal_wpp_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  // If the customer specified a card on file, skip the normal validation.
+  if (module_exists('commerce_cardonfile') && !empty($payment_method['settings']['cardonfile']) &&
+    !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    return;
+  }
   module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
 
   // Validate the credit card fields.
@@ -229,6 +248,13 @@ function commerce_paypal_wpp_submit_form_validate($payment_method, $pane_form, $
  * Payment method callback: checkout form submission.
  */
 function commerce_paypal_wpp_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  // If the customer specified payment using a card on file, attempt that now
+  // and simply return the result.
+  if (module_exists('commerce_cardonfile') && $payment_method['settings']['cardonfile'] &&
+    !empty($pane_values['cardonfile']) && $pane_values['cardonfile'] !== 'new') {
+    return commerce_paypal_cof_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge);
+  }
+
   // Display an error and prevent the payment attempt if PayPal WPP has not been
   // configured yet.
   if (empty($payment_method['settings'])) {
@@ -396,6 +422,9 @@ function commerce_paypal_wpp_submit_form_submit($payment_method, $pane_form, $pa
     case 'Success':
       $transaction->remote_id = $response['TRANSACTIONID'];
 
+      // Try to store local cc profile during success.
+      commerce_paypal_cof_create($payment_method, $pane_values, $order, $response, $billing_address);
+
       // Set the transaction status based on the type of transaction this was.
       switch ($payment_method['settings']['txn_type']) {
         case COMMERCE_CREDIT_AUTH_ONLY:
@@ -451,6 +480,89 @@ function commerce_paypal_wpp_submit_form_submit($payment_method, $pane_form, $pa
     return FALSE;
   }
 }
+
+function commerce_paypal_cof_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  exit('woohoo!');
+}
+
+function commerce_paypal_cof_create($payment_method, $pane_values, $order, $response, $billing_address) {
+  // If Card on File storage is enabled via CIM and the form says to store data...
+  if (module_exists('commerce_cardonfile') && !empty($payment_method['settings']['cardonfile']) &&
+    !empty($pane_values['credit_card']['cardonfile_store']) && $pane_values['credit_card']['cardonfile_store']) {
+    // Build a payment details array for the credit card.
+    $payment_details = array(
+      'cardNumber' => $pane_values['credit_card']['number'],
+      'expirationDate' => $pane_values['credit_card']['exp_year'] . '-' . $pane_values['credit_card']['exp_month'],
+    );
+    // Determine the credit card type if possible for use in later code.
+    if (!empty($pane_values['credit_card']['number'])) {
+      module_load_include('inc', 'commerce_payment', 'includes/commerce_payment.credit_card');
+      $card_type = commerce_payment_validate_credit_card_type($pane_values['credit_card']['number'], array_keys(commerce_payment_credit_card_types()));
+    }
+
+    if (isset($pane_values['credit_card']['code'])) {
+      $payment_details['cardCode'] = $pane_values['credit_card']['code'];
+    }
+
+    // First look to see if we already have cards on file for the user.
+    $stored_cards = commerce_cardonfile_data_load_multiple($order->uid, $payment_method['instance_id']);
+    $add_to_profile = NULL;
+
+    // If we didn't find any, attempt to make a new Customer Profile now.
+    if (empty($stored_cards)) {
+      $remote_id = (string) $response['TRANSACTIONID'];
+
+      $card_data = array(
+        'uid' => $order->uid,
+        'payment_method' => $payment_method['method_id'],
+        'instance_id' => $payment_method['instance_id'],
+        'remote_id' => $remote_id,
+        'card_type' => !empty($card_type) ? $card_type : 'card',
+        'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+        'card_number' => substr($pane_values['credit_card']['number'], -4),
+        'card_exp_month' => $pane_values['credit_card']['exp_month'],
+        'card_exp_year' => $pane_values['credit_card']['exp_year'],
+        'status' => 1,
+      );
+
+      // Save and log the creation of the new card on file.
+      commerce_cardonfile_data_save($card_data);
+      watchdog('commerce_authnet', 'CIM Customer Profile @profile_id created and saved to user @uid.', array('@profile_id' => (string) $response->customerProfileId, '@uid' => $order->uid));
+    }
+    else {
+      // Extract the user's Customer Profile ID from the first card's remote ID.
+      $card_data = reset($stored_cards);
+      list($cim_customer_profile_id, $cim_payment_profile_id) = explode('|', $card_data['remote_id']);
+
+      // Attempt to add the card as a new payment profile to this Customer Profile.
+      $add_to_profile = $cim_customer_profile_id;
+    }
+
+    // Attempt to add the card to an existing Customer Profile if specified.
+    if (!empty($add_to_profile)) {
+      $remote_id = $reponse['TRANSACTIONID'];
+
+      $card_data = array(
+        'uid' => $order->uid,
+        'payment_method' => $payment_method['method_id'],
+        'instance_id' => $payment_method['instance_id'],
+        'remote_id' => $remote_id,
+        'card_type' => !empty($card_type) ? $card_type : 'card',
+        'card_name' => !empty($billing_address['name_line']) ? $billing_address['name_line'] : '',
+        'card_number' => substr($pane_values['credit_card']['number'], -4),
+        'card_exp_month' => $pane_values['credit_card']['exp_month'],
+        'card_exp_year' => $pane_values['credit_card']['exp_year'],
+        'status' => 1,
+      );
+
+      // Save and log the creation of the new card on file.
+      commerce_cardonfile_data_save($card_data);
+      watchdog('commerce_authnet', 'CIM Payment Profile added to Customer Profile @profile_id for user @uid.', array('@profile_id' => $add_to_profile, '@uid' => $order->uid));
+
+    }
+  }
+}
+
 
 /**
  * Returns the value for a credit card type expected by PayPal.
